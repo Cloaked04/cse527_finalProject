@@ -9,11 +9,59 @@ import numpy as np
 from einops import rearrange
 from einops.layers.torch import Rearrange
 from PIL import Image
-import glob
 from torchvision.transforms import functional as F
-from torchvision.io import read_image
 import pandas as pd
 from pathlib import Path
+
+# Helper function
+def pair(t):
+    return t if isinstance(t, tuple) else (t, t)
+
+# Attention and FeedForward classes
+class Attention(nn.Module):
+    def __init__(self, dim, heads=8, dim_head=64, dropout=0.):
+        super().__init__()
+        inner_dim = dim_head * heads
+
+        self.heads = heads
+        self.scale = dim_head ** -0.5
+
+        self.to_qkv = nn.Linear(dim, inner_dim * 3, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+        self.to_out = nn.Sequential(
+            nn.Linear(inner_dim, dim),
+            nn.Dropout(dropout)
+        )
+        
+    def forward(self, x):
+        b, n, _ = x.shape
+        h = self.heads
+
+        qkv = self.to_qkv(x).chunk(3, dim=-1)  # Split into q, k, v
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h=h), qkv)
+
+        q = q * self.scale
+        attn = torch.matmul(q, k.transpose(-1, -2))
+        attn = attn.softmax(dim=-1)
+        attn = self.dropout(attn)
+
+        out = torch.matmul(attn, v)
+        out = rearrange(out, 'b h n d -> b n (h d)')
+        return self.to_out(out)
+
+class FeedForward(nn.Module):
+    def __init__(self, dim, hidden_dim, dropout=0.):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout)
+        )
+    def forward(self, x):
+        return self.net(x)
 
 class OxfordPetsSegmentation(Dataset):
     def __init__(self, root_dir, split='train', transform=None):
@@ -43,14 +91,12 @@ class OxfordPetsSegmentation(Dataset):
         image = Image.open(img_path).convert('RGB')
         mask = Image.open(mask_path)
         
-        # Convert mask to binary (foreground/background)
-        mask = np.array(mask)
-        mask = (mask == 2).astype(np.float32)  # 2 is foreground
-        mask = Image.fromarray(mask)
-
         if self.transform:
             image = self.transform(image)
-            mask = F.to_tensor(mask)
+        
+        # Process mask
+        mask = np.array(mask) - 1  # mask values are {0,1,2}
+        mask = torch.from_numpy(mask).long()
         
         return image, mask
 
@@ -64,6 +110,7 @@ class ViTSegmentation(nn.Module):
         depth,
         heads,
         mlp_dim,
+        num_classes,
         channels=3,
         dim_head=64,
         dropout=0.0,
@@ -81,7 +128,7 @@ class ViTSegmentation(nn.Module):
 
         self.patch_size = patch_size
         self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
-        self.patch_to_embedding = nn.Sequential(
+        self.to_patch_embedding = nn.Sequential(
             Rearrange('b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1=patch_height, p2=patch_width),
             nn.Linear(patch_dim, dim),
         )
@@ -95,13 +142,8 @@ class ViTSegmentation(nn.Module):
                 nn.LayerNorm(dim),
                 Attention(dim, heads=heads, dim_head=dim_head, dropout=dropout),
                 nn.LayerNorm(dim),
-                FeedForward(dim, mlp_dim, dropout=dropout)
+                FeedForward(dim, hidden_dim=mlp_dim, dropout=dropout)
             ]))
-
-        self.to_patch_embedding = nn.Sequential(
-            Rearrange('b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1=patch_height, p2=patch_width),
-            nn.Linear(patch_dim, dim),
-        )
 
         self.decoder = nn.Sequential(
             nn.Linear(dim, patch_dim),
@@ -118,8 +160,7 @@ class ViTSegmentation(nn.Module):
             nn.ReLU(),
             nn.Conv2d(64, 32, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.Conv2d(32, 1, kernel_size=1),
-            nn.Sigmoid()
+            nn.Conv2d(32, num_classes, kernel_size=1)
         )
 
     def forward(self, img):
@@ -167,31 +208,39 @@ def train_model():
         'heads': 12,
         'mlp_dim': 3072,
         'dropout': 0.1,
-        'emb_dropout': 0.1
+        'emb_dropout': 0.1,
+        'num_classes': 3  # Background, Foreground, Boundary
     })
     config = wandb.config
 
     # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # Data transforms
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
+    # Data transforms with augmentation for training
+    train_transform = transforms.Compose([
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(10),
+        transforms.RandomResizedCrop(config.image_size, scale=(0.8, 1.0)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    val_transform = transforms.Compose([
+        transforms.Resize((config.image_size, config.image_size)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
 
     # Create datasets
     train_dataset = OxfordPetsSegmentation(
-        root_dir='path/to/oxford-iiit-pet',
+        root_dir='path/to/oxford-iiit-pet',  # Replace with actual path
         split='train',
-        transform=transform
+        transform=train_transform
     )
     
     val_dataset = OxfordPetsSegmentation(
-        root_dir='path/to/oxford-iiit-pet',
+        root_dir='path/to/oxford-iiit-pet',  # Replace with actual path
         split='val',
-        transform=transform
+        transform=val_transform
     )
 
     # Create data loaders
@@ -206,21 +255,30 @@ def train_model():
         depth=config.depth,
         heads=config.heads,
         mlp_dim=config.mlp_dim,
+        num_classes=config.num_classes,
         dropout=config.dropout,
         emb_dropout=config.emb_dropout
     ).to(device)
 
     # Loss function and optimizer
-    criterion = nn.BCELoss()
+    criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs)
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
 
     # Metrics
-    def calculate_iou(pred, target):
-        pred = (pred > 0.5).float()
-        intersection = (pred * target).sum()
-        union = pred.sum() + target.sum() - intersection
-        return (intersection + 1e-6) / (union + 1e-6)
+    def calculate_iou(pred, target, num_classes=3):
+        pred = pred.argmax(dim=1)  # For multi-class predictions
+        iou_per_class = []
+        for cls in range(num_classes):
+            pred_cls = (pred == cls).float()
+            target_cls = (target == cls).float()
+            intersection = (pred_cls * target_cls).sum()
+            union = pred_cls.sum() + target_cls.sum() - intersection
+            if union == 0:
+                iou_per_class.append(1.0 if intersection == 0 else 0.0)
+            else:
+                iou_per_class.append((intersection + 1e-6) / (union + 1e-6))
+        return sum(iou_per_class) / len(iou_per_class)
 
     # Training loop
     best_iou = 0.0
@@ -240,14 +298,17 @@ def train_model():
             optimizer.step()
             
             total_loss += loss.item()
-            total_iou += calculate_iou(outputs, masks)
+            total_iou += calculate_iou(outputs, masks).item()
 
             if batch_idx % 10 == 0:
                 wandb.log({
                     'train_loss': loss.item(),
-                    'train_iou': calculate_iou(outputs, masks),
+                    'train_iou': calculate_iou(outputs, masks).item(),
                     'learning_rate': optimizer.param_groups[0]['lr']
                 })
+
+        avg_train_loss = total_loss / len(train_loader)
+        avg_train_iou = total_iou / len(train_loader)
 
         # Validation
         model.eval()
@@ -255,29 +316,36 @@ def train_model():
         val_iou = 0
         
         with torch.no_grad():
-            for images, masks in val_loader:
+            for batch_idx, (images, masks) in enumerate(val_loader):
                 images, masks = images.to(device), masks.to(device)
                 outputs = model(images)
                 
                 val_loss += criterion(outputs, masks).item()
-                val_iou += calculate_iou(outputs, masks)
+                val_iou += calculate_iou(outputs, masks).item()
 
                 # Log sample predictions
                 if batch_idx % 100 == 0:
+                    pred_masks = outputs.argmax(dim=1).cpu().numpy()
+                    true_masks = masks.cpu().numpy()
+                    images_np = images.cpu().numpy()
+
                     wandb.log({
-                        "predictions": wandb.Image(
-                            images[0],
-                            masks={
-                                "predictions": {"mask_data": outputs[0].cpu().numpy()},
-                                "ground_truth": {"mask_data": masks[0].cpu().numpy()}
-                            }
-                        )
+                        "predictions": [
+                            wandb.Image(images_np[i].transpose(1,2,0), caption=f"Prediction",
+                                masks={
+                                    "predictions": {"mask_data": pred_masks[i]},
+                                    "ground_truth": {"mask_data": true_masks[i]}
+                                }
+                            ) for i in range(min(4, images_np.shape[0]))
+                        ]
                     })
 
+        avg_val_loss = val_loss / len(val_loader)
         avg_val_iou = val_iou / len(val_loader)
+
         wandb.log({
             'epoch': epoch,
-            'val_loss': val_loss / len(val_loader),
+            'val_loss': avg_val_loss,
             'val_iou': avg_val_iou
         })
 
@@ -288,7 +356,13 @@ def train_model():
 
         scheduler.step()
 
+        print(f"Epoch {epoch + 1}/{config.epochs} - "
+              f"Train Loss: {avg_train_loss:.4f}, Train IoU: {avg_train_iou:.4f}, "
+              f"Val Loss: {avg_val_loss:.4f}, Val IoU: {avg_val_iou:.4f}")
+
+    print(f"Training completed. Best validation IoU: {best_iou:.4f}")
     wandb.finish()
 
 if __name__ == '__main__':
     train_model()
+
