@@ -316,6 +316,8 @@ def main():
                     'learning_rate': optimizer.param_groups[0]['lr']
                 })
 
+        train_acc = 100. * correct / total
+
         # Validation
         model.eval()
         test_loss = 0.0
@@ -341,7 +343,7 @@ def main():
         })
 
         print(f"Epoch {epoch + 1}/{config.epochs} - "
-              f"Train Loss: {running_loss / len(train_loader):.4f}, Train Acc: {100. * correct / total:.2f}%, "
+              f"Train Loss: {running_loss / len(train_loader):.4f}, Train Acc: {train_acc:.2f}%, "
               f"Test Loss: {avg_test_loss:.4f}, Test Acc: {acc:.2f}%")
 
         # Save best model

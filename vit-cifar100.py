@@ -9,7 +9,7 @@ import numpy as np
 from einops import rearrange
 from einops.layers.torch import Rearrange
 
-# Keep the Attention, FeedForward, and pair helper function from original code
+
 class Attention(nn.Module):
     def __init__(self, dim, *, dim_head=64, heads=8, dropout=0.0):
         super().__init__()
@@ -27,13 +27,13 @@ class Attention(nn.Module):
         B, N, C = x.shape
         qkv = self.to_qkv(x)
         qkv = qkv.reshape(B, N, 3, self.heads, self.dim_head)
-        qkv = qkv.permute(2, 0, 3, 1, 4)
+        qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, heads, N, dim_head)
         q, k, v = qkv[0], qkv[1], qkv[2]
         q = q * self.scale
-        attn = (q @ k.transpose(-2, -1))
+        attn = torch.matmul(q, k.transpose(-2, -1))
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
-        out = attn @ v
+        out = torch.matmul(attn, v)
         out = out.transpose(1, 2).reshape(B, N, -1)
         out = self.proj(out)
         out = self.proj_drop(out)
@@ -56,7 +56,7 @@ class FeedForward(nn.Module):
 def pair(t):
     return t if isinstance(t, tuple) else (t, t)
 
-# Modified ViT for CIFAR-10
+# Modified ViT for CIFAR-100
 class ViT(nn.Module):
     def __init__(
         self,
@@ -101,7 +101,7 @@ class ViT(nn.Module):
                 nn.LayerNorm(dim),
                 Attention(dim, dim_head=dim_head, heads=heads, dropout=dropout),
                 nn.LayerNorm(dim),
-                FeedForward(dim, mlp_dim, dropout=dropout)
+                FeedForward(dim, dim_inner=mlp_dim, dropout=dropout)
             ]))
 
         self.mlp_head = nn.Sequential(
@@ -137,15 +137,15 @@ def main():
         'model': 'ViT',
         'dataset': 'CIFAR-100',
         'epochs': 100,
-        'batch_size': 128,  # Smaller batch size for CIFAR-10
+        'batch_size': 128,  # Batch size for CIFAR-100
         'learning_rate': 3e-4,
         'weight_decay': 1e-4,
-        'image_size': 32,   # CIFAR-10 image size
-        'patch_size': 4,    # Smaller patch size for CIFAR-10
-        'dim': 384,        # Reduced model size
-        'depth': 8,        # Reduced depth
-        'heads': 8,        # Reduced heads
-        'mlp_dim': 1536,   # Reduced MLP dimension
+        'image_size': 32,   # CIFAR-100 image size
+        'patch_size': 4,    # Patch size for CIFAR-100
+        'dim': 384,        # Model dimension
+        'depth': 8,        # Transformer depth
+        'heads': 8,        # Number of heads
+        'mlp_dim': 384 * 4,   # MLP hidden dimension
         'dropout': 0.1,
         'emb_dropout': 0.1,
         'num_classes': 100
@@ -222,6 +222,8 @@ def main():
                     'learning_rate': optimizer.param_groups[0]['lr']
                 })
 
+        train_acc = 100. * correct / total
+
         # Validation
         model.eval()
         test_loss = 0
@@ -252,6 +254,11 @@ def main():
 
         scheduler.step()
 
+        print(f"Epoch {epoch + 1}/{config.epochs} - "
+              f"Train Loss: {running_loss / len(train_loader):.4f}, Train Acc: {train_acc:.2f}%, "
+              f"Test Loss: {test_loss / len(test_loader):.4f}, Test Acc: {acc:.2f}%")
+
+    print(f"Training completed. Best Test Accuracy: {best_acc:.2f}%")
     wandb.finish()
 
 if __name__ == '__main__':
