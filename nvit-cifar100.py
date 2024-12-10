@@ -225,7 +225,7 @@ class nViT(nn.Module):
 
 def main():
     # Initialize wandb
-    wandb.init(project='nvit-cifar100', config={
+    wandb.init(project='nvit-cifar100-vanilla-dim512', config={
         'model': 'nViT',
         'dataset': 'CIFAR-100',
         'epochs': 100,
@@ -234,10 +234,10 @@ def main():
         'weight_decay': 1e-4,
         'image_size': 32,
         'patch_size': 4,
-        'dim': 384,
+        'dim': 512,
         'depth': 8,
         'heads': 8,
-        'mlp_dim': 384 * 4,
+        'mlp_dim': 512 * 4,
         'dropout': 0.1,
         'num_classes': 100,
         'dim_head': 64
@@ -357,4 +357,4 @@ def main():
     wandb.finish()
 
 if __name__ == '__main__':
-    main()
+    main()  

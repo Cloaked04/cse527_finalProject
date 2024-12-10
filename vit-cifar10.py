@@ -9,7 +9,11 @@ import numpy as np
 from einops import rearrange
 from einops.layers.torch import Rearrange
 
-# Keep the Attention, FeedForward, and pair helper function from original code
+# Helper function
+def pair(t):
+    return t if isinstance(t, tuple) else (t, t)
+
+# Attention and FeedForward classes
 class Attention(nn.Module):
     def __init__(self, dim, *, dim_head=64, heads=8, dropout=0.0):
         super().__init__()
@@ -27,34 +31,31 @@ class Attention(nn.Module):
         B, N, C = x.shape
         qkv = self.to_qkv(x)
         qkv = qkv.reshape(B, N, 3, self.heads, self.dim_head)
-        qkv = qkv.permute(2, 0, 3, 1, 4)
+        qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, heads, N, dim_head)
         q, k, v = qkv[0], qkv[1], qkv[2]
         q = q * self.scale
-        attn = (q @ k.transpose(-2, -1))
+        attn = torch.matmul(q, k.transpose(-2, -1))
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
-        out = attn @ v
+        out = torch.matmul(attn, v)
         out = out.transpose(1, 2).reshape(B, N, -1)
         out = self.proj(out)
         out = self.proj_drop(out)
         return out
 
 class FeedForward(nn.Module):
-    def __init__(self, dim, dim_inner, dropout=0.0):
+    def __init__(self, dim, hidden_dim, dropout=0.0):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(dim, dim_inner),
+            nn.Linear(dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(dim_inner, dim),
+            nn.Linear(hidden_dim, dim),
             nn.Dropout(dropout)
         )
 
     def forward(self, x):
         return self.net(x)
-
-def pair(t):
-    return t if isinstance(t, tuple) else (t, t)
 
 # Modified ViT for CIFAR-10
 class ViT(nn.Module):
@@ -101,7 +102,7 @@ class ViT(nn.Module):
                 nn.LayerNorm(dim),
                 Attention(dim, dim_head=dim_head, heads=heads, dropout=dropout),
                 nn.LayerNorm(dim),
-                FeedForward(dim, mlp_dim, dropout=dropout)
+                FeedForward(dim, hidden_dim=mlp_dim, dropout=dropout)
             ]))
 
         self.mlp_head = nn.Sequential(
@@ -113,8 +114,8 @@ class ViT(nn.Module):
         x = self.to_patch_embedding(img)
         B, N, _ = x.shape
 
-        cls_tokens = self.cls_token.expand(B, -1, -1)
-        x = torch.cat((cls_tokens, x), dim=1)
+        cls_tokens = self.cls_token.expand(B, -1, -1)  # (B, 1, dim)
+        x = torch.cat((cls_tokens, x), dim=1)  # (B, N+1, dim)
         x = x + self.pos_embedding[:, :N + 1, :]
         x = self.dropout(x)
 
@@ -137,15 +138,15 @@ def main():
         'model': 'ViT',
         'dataset': 'CIFAR-10',
         'epochs': 100,
-        'batch_size': 128,  # Smaller batch size for CIFAR-10
+        'batch_size': 128,  # Batch size for CIFAR-10
         'learning_rate': 3e-4,
         'weight_decay': 1e-4,
         'image_size': 32,   # CIFAR-10 image size
-        'patch_size': 4,    # Smaller patch size for CIFAR-10
-        'dim': 384,        # Reduced model size
-        'depth': 6,        # Reduced depth
-        'heads': 6,        # Reduced heads
-        'mlp_dim': 1536,   # Reduced MLP dimension
+        'patch_size': 4,    # Patch size for CIFAR-10
+        'dim': 384,        # Model dimension
+        'depth': 6,        # Transformer depth
+        'heads': 6,        # Number of heads
+        'mlp_dim': 384 * 4,   # MLP hidden dimension
         'dropout': 0.1,
         'emb_dropout': 0.1,
         'num_classes': 10
@@ -157,7 +158,7 @@ def main():
 
     # Data transforms
     transform_train = transforms.Compose([
-        transforms.RandomCrop(32, padding=4),
+        transforms.RandomCrop(config.image_size, padding=4),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
@@ -222,9 +223,15 @@ def main():
                     'learning_rate': optimizer.param_groups[0]['lr']
                 })
 
+        # Print training progress
+        train_loss = running_loss / len(train_loader)
+        train_acc = 100. * correct / total
+        print(f"Epoch {epoch + 1}/{config.epochs} - "
+              f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
+
         # Validation
         model.eval()
-        test_loss = 0
+        test_loss = 0.0
         correct = 0
         total = 0
         with torch.no_grad():
@@ -239,11 +246,14 @@ def main():
                 correct += predicted.eq(targets).sum().item()
 
         acc = 100. * correct / total
+        avg_test_loss = test_loss / len(test_loader)
         wandb.log({
-            'test_loss': test_loss / len(test_loader),
+            'test_loss': avg_test_loss,
             'test_acc': acc,
             'epoch': epoch
         })
+
+        print(f"Test Loss: {avg_test_loss:.4f}, Test Acc: {acc:.2f}%")
 
         # Save best model
         if acc > best_acc:
@@ -252,7 +262,9 @@ def main():
 
         scheduler.step()
 
+    print(f"Training completed. Best Test Accuracy: {best_acc:.2f}%")
     wandb.finish()
 
 if __name__ == '__main__':
     main()
+

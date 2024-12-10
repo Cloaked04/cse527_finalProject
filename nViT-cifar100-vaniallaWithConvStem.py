@@ -1,4 +1,5 @@
 import torch
+import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader
 import torchvision
@@ -11,11 +12,16 @@ from einops import rearrange
 from einops.layers.torch import Rearrange
 import torch.nn.utils.parametrize as parametrize
 import math
+import random
+import copy
 
 # Set random seeds for reproducibility
 torch.manual_seed(42)
 torch.cuda.manual_seed_all(42)
 np.random.seed(42)
+random.seed(42)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
 # Helper functions
 def exists(v):
@@ -38,7 +44,6 @@ class L2Norm(nn.Module):
     def __init__(self, dim=-1):
         super().__init__()
         self.dim = dim
-
     def forward(self, t):
         return l2norm(t, dim=self.dim)
 
@@ -46,7 +51,6 @@ class NormLinear(nn.Module):
     def __init__(self, dim, dim_out, norm_dim_in=True):
         super().__init__()
         self.linear = nn.Linear(dim, dim_out, bias=False)
-
         parametrize.register_parametrization(
             self.linear,
             'weight',
@@ -60,6 +64,21 @@ class NormLinear(nn.Module):
     def forward(self, x):
         return self.linear(x)
 
+# ConvStem Module
+class ConvStem(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels // 2, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(out_channels // 2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels // 2, out_channels, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+    def forward(self, x):
+        return self.conv(x)
+
 # Scaled dot product attention function
 def scaled_dot_product_attention(q, k, v, dropout_p=0., training=True):
     d_k = q.size(-1)
@@ -70,7 +89,6 @@ def scaled_dot_product_attention(q, k, v, dropout_p=0., training=True):
     output = torch.matmul(attn_weights, v)
     return output
 
-# Attention and FeedForward classes
 class Attention(nn.Module):
     def __init__(self, dim, *, dim_head=64, heads=8, dropout=0.):
         super().__init__()
@@ -91,12 +109,10 @@ class Attention(nn.Module):
 
     def forward(self, x):
         q, k, v = self.to_q(x), self.to_k(x), self.to_v(x)
-
         q, k, v = map(self.split_heads, (q, k, v))
 
         # Query key rmsnorm
         q, k = map(l2norm, (q, k))
-
         q = q * self.q_scale
         k = k * self.k_scale
 
@@ -127,16 +143,14 @@ class FeedForward(nn.Module):
 
     def forward(self, x):
         hidden, gate = self.to_hidden(x), self.to_gate(x)
-
         hidden = hidden * self.hidden_scale
         gate = gate * self.gate_scale * (self.dim ** 0.5)
 
         hidden = F.silu(gate) * hidden
-
         hidden = self.dropout(hidden)
         return self.to_out(hidden)
 
-# nViT base class
+# nViT base class with ConvStem
 class nViT(nn.Module):
     def __init__(
         self,
@@ -155,8 +169,8 @@ class nViT(nn.Module):
     ):
         super().__init__()
         image_height, image_width = pair(image_size)
-
-        assert divisible_by(image_height, patch_size) and divisible_by(image_width, patch_size), 'Image dimensions must be divisible by the patch size.'
+        assert divisible_by(image_height, patch_size) and divisible_by(image_width, patch_size), \
+            'Image dimensions must be divisible by the patch size.'
 
         patch_height_dim, patch_width_dim = (image_height // patch_size), (image_width // patch_size)
         patch_dim = channels * (patch_size ** 2)
@@ -167,21 +181,22 @@ class nViT(nn.Module):
         self.num_patches = num_patches
         self.image_size = image_size
 
+        # Insert ConvStem before patch embedding
+        self.conv_stem = ConvStem(channels, dim)
+
         self.to_patch_embedding = nn.Sequential(
-            Rearrange('b c (h p1) (w p2) -> b (h w) (c p1 p2)', p1=patch_size, p2=patch_size),
-            NormLinear(patch_dim, dim, norm_dim_in=False),
+            Rearrange('b c h w -> b (h w) c'),
+            NormLinear(dim, dim, norm_dim_in=False),
         )
 
         self.abs_pos_emb = NormLinear(dim, num_patches)
 
         residual_lerp_scale_init = default(residual_lerp_scale_init, 1. / depth)
-
         self.dim = dim
         self.scale = dim ** 0.5
 
         self.layers = nn.ModuleList([])
         self.residual_lerp_scales = nn.ModuleList([])
-
         for _ in range(depth):
             self.layers.append(nn.ModuleList([
                 Attention(dim, dim_head=dim_head, heads=heads, dropout=dropout),
@@ -201,8 +216,8 @@ class nViT(nn.Module):
 
     def forward(self, x):
         device = x.device
-
-        tokens = self.to_patch_embedding(x)
+        x = self.conv_stem(x)  # Shape: B, dim, H/4, W/4
+        tokens = self.to_patch_embedding(x)  # B, (H/4 * W/4), dim
 
         seq_len = tokens.shape[-2]
         pos_emb = self.abs_pos_emb.weight[torch.arange(seq_len, device=device)]
@@ -211,23 +226,21 @@ class nViT(nn.Module):
 
         for (attn, ff), residual_scales in zip(self.layers, self.residual_lerp_scales):
             attn_alpha, ff_alpha = residual_scales
-
             attn_out = l2norm(attn(tokens))
             tokens = l2norm(tokens.lerp(attn_out, attn_alpha * self.scale))
 
             ff_out = l2norm(ff(tokens))
             tokens = l2norm(tokens.lerp(ff_out, ff_alpha * self.scale))
 
-        # Classification token (mean pooling)
         tokens = tokens.mean(dim=1)
         logits = self.mlp_head(tokens)
         return logits
 
 def main():
     # Initialize wandb
-    wandb.init(project='nvit-cifar10', config={
+    wandb.init(project='nvit-cifar100', config={
         'model': 'nViT',
-        'dataset': 'CIFAR-10',
+        'dataset': 'CIFAR-100',
         'epochs': 100,
         'batch_size': 128,
         'learning_rate': 3e-4,
@@ -239,32 +252,31 @@ def main():
         'heads': 6,
         'mlp_dim': 384 * 4,
         'dropout': 0.1,
-        'num_classes': 10,
-        'dim_head': 64
+        'num_classes': 100,
+        'dim_head': 64,
+        'patience': 20  # Patience for early stopping
     })
     config = wandb.config
 
     # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # Data transforms
+    # Data transforms for CIFAR-100
     transform_train = transforms.Compose([
         transforms.RandomCrop(config.image_size, padding=4),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465),
-                             (0.2470, 0.2435, 0.2616)),
+        transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
     ])
 
     transform_test = transforms.Compose([
         transforms.ToTensor(),
-        transforms.Normalize((0.4914, 0.4822, 0.4465),
-                             (0.2470, 0.2435, 0.2616)),
+        transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
     ])
 
-    # Load CIFAR-10 dataset
-    train_dataset = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform_train)
-    test_dataset = datasets.CIFAR10(root='./data', train=False, download=True, transform=transform_test)
+    # Load CIFAR-100 dataset
+    train_dataset = datasets.CIFAR100(root='./data', train=True, download=True, transform=transform_train)
+    test_dataset = datasets.CIFAR100(root='./data', train=False, download=True, transform=transform_test)
 
     train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=4, pin_memory=True)
     test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False, num_workers=4, pin_memory=True)
@@ -285,10 +297,16 @@ def main():
     # Loss function and optimizer
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
+
+    # Learning rate scheduler with cosine annealing
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs)
 
-    # Training loop
+    # Early Stopping parameters
     best_acc = 0.0
+    best_model_wts = copy.deepcopy(model.state_dict())
+    patience = config.patience
+    trigger_times = 0
+
     for epoch in range(config.epochs):
         model.train()
         running_loss = 0.0
@@ -302,6 +320,7 @@ def main():
             outputs = model(inputs)
             loss = criterion(outputs, targets)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Optional gradient clipping
             optimizer.step()
 
             running_loss += loss.item()
@@ -316,7 +335,10 @@ def main():
                     'learning_rate': optimizer.param_groups[0]['lr']
                 })
 
-        # Validation
+        train_loss = running_loss / len(train_loader)
+        train_acc = 100. * correct / total
+
+        # Validation Phase
         model.eval()
         test_loss = 0.0
         correct = 0
@@ -341,18 +363,36 @@ def main():
         })
 
         print(f"Epoch {epoch + 1}/{config.epochs} - "
-              f"Train Loss: {running_loss / len(train_loader):.4f}, Train Acc: {100. * correct / total:.2f}%, "
+              f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%, "
               f"Test Loss: {avg_test_loss:.4f}, Test Acc: {acc:.2f}%")
 
-        # Save best model
+        # Early Stopping Check
         if acc > best_acc:
             best_acc = acc
-            torch.save(model.state_dict(), os.path.join(wandb.run.dir, 'best_model.pth'))
+            best_model_wts = copy.deepcopy(model.state_dict())
+            trigger_times = 0
+            # Save the best model
+            torch.save(model.state_dict(), 'best_nvit_cifar100.pth')
+        else:
+            trigger_times += 1
+            if trigger_times >= patience:
+                print("Early stopping triggered!")
+                break
 
+        # Update scheduler
         scheduler.step()
 
+        # Log additional hyperparameters and metrics at the end of each epoch
+        wandb.log({
+            'epoch': epoch,
+            'best_test_acc': best_acc
+        })
+
+    # Load best model weights after early stopping or completion
+    model.load_state_dict(best_model_wts)
     print(f"Training completed. Best Test Accuracy: {best_acc:.2f}%")
     wandb.finish()
 
 if __name__ == '__main__':
     main()
+
